@@ -1,0 +1,37 @@
+[Unit]
+Description=Prompt-Mesh VRAM-Aware AI Gateway & Meta-Prompt Orchestrator
+Documentation=https://github.com/BannedForWhat/prompt-mesh
+After=network.target amdgpu-sentinel.service
+Wants=amdgpu-sentinel.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/prompt-mesh
+Restart=on-failure
+RestartSec=2s
+
+# Защита от дребезга (Anti-Flapping)
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+# Ограничение ресурсов cgroups v2
+MemoryAccounting=yes
+MemoryMax=128M
+MemoryHigh=96M
+CPUWeight=50
+
+# Тюнинг кучи glibc для минимизации фрагментации памяти Python
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=65536
+
+# Харденинг пользовательского уровня
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
