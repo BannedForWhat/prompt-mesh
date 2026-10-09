@@ -4,15 +4,15 @@ Documentation=https://github.com/BannedForWhat/prompt-mesh
 After=network.target amdgpu-sentinel.service
 Wants=amdgpu-sentinel.service
 
+# Защита от дребезга перезапусков (Anti-Flapping) в секции [Unit]
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/prompt-mesh
 Restart=on-failure
 RestartSec=2s
-
-# Защита от дребезга (Anti-Flapping)
-StartLimitIntervalSec=30s
-StartLimitBurst=5
 
 # Ограничение ресурсов cgroups v2
 MemoryAccounting=yes
