@@ -2,18 +2,16 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Arch_Linux-blue.svg?logo=arch-linux)](https://archlinux.org/)
 [![Kernel](https://img.shields.io/badge/Kernel-6.x-green.svg?logo=linux)](https://kernel.org/)
-[![Runtime](https://img.shields.io/badge/Runtime-asyncio_Zero--Copy-yellow.svg?logo=python)](https://python.org/)
-[![Telemetry](https://img.shields.io/badge/IPC-POSIX_SHM_(mmap)-orange.svg)](https://github.com/BannedForWhat/amdgpu-sentinel)
+[![Runtime](https://img.shields.io/badge/Runtime-Python_asyncio-yellow.svg?logo=python)](https://python.org/)
+[![IPC](https://img.shields.io/badge/IPC-POSIX_SHM_(mmap)-orange.svg)](https://github.com/BannedForWhat/amdgpu-sentinel)
 [![Sandbox](https://img.shields.io/badge/Sandbox-systemd_cgroups_v2-black.svg?logo=systemd)](https://systemd.io/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Высокопроизводительный платформенный AI-шлюз и оркестратор мета-промптов (OpenAI-compatible Reverse Proxy), спроектированный для превентивной защиты локальной LLM-инфраструктуры от аппаратного переполнения видеопамяти и лавинообразного падения пропускной способности (TTM Eviction Storm).
+L7-шлюз и обратный прокси для локального кластера llama.cpp с поддержкой спецификации OpenAI API (`/v1/chat/completions`, `/v1/completions`).
 
-Выступает единой точкой входа (порт `8000`) для редакторов кода (VS Code Continue.dev, Cursor, HTTP-клиенты) и динамически маршрутизирует запросы между моделями кластера `llama-server` с учетом физического состояния GPU.
+Принимает запросы от редакторов кода (VS Code Continue.dev, Cursor), отслеживает объем видеопамяти через разделяемую память amdgpu-sentinel и усекает контекст при риске вытеснения данных в системную память хоста.
 
----
-
-## Архитектура системы
+## Архитектура
 
 ```text
        [ VS Code / Continue.dev / HTTP Clients ]
@@ -29,55 +27,36 @@
        |   4. Circuit Breaker: автопереключение 32B -> 7B (<think>)|
        +─────────────┬─────────────────────────────┬───────────────+
                      │                             │
-    (Легкий код, 56 t/s)                           │ (Сложная архитектура)
+       (генерация кода, 56 t/s)                    │ (глубокий анализ)
                      ▼                             ▼
        [ Qwen-7B (порт 8080) ]       [ DeepSeek-32B (порт 8082) ]
 ```
 
----
+## Функциональность
 
-## Ключевые возможности
+1. **Контроль памяти видеокарты:** шлюз считывает структуры из `/dev/shm/vram_guard` через `mmap` без системных вызовов ввода-вывода. При утилизации VRAM выше 85% или флаге `ttm_alert` включается алгоритм **Middle-Out Pruning**: системный промпт и последние сообщения сохраняются, а центральная часть истории удаляется.
+2. **Сохранение инструкций (Recency Bias):** ключевые директивы системного промпта (`C++17`, `POSIX`, `Zero-Allocation`) дублируются в конец последнего сообщения пользователя для предотвращения потери контекста (Threshold Decay).
+3. **Отмена задач на бэкенде:** при разрыве клиентского соединения шлюз закрывает TCP-сокет к llama-server, что прерывает декодирование на стороне сервера, и отправляет запрос `POST /slots/{id}?action=erase` для очистки KV-кэша.
+4. **Маршрутизация и Circuit Breaker:** запросы распределяются по портам: автодополнение — 8081 (1.5B), код — 8080 (7B), системные задачи — 8082 (32B). При трех последовательных таймаутах на порту 8082 автомат перенаправляет трафик на порт 8080 с добавлением тегов `<think>`.
+5. **Потребление памяти:** шлюз написан на `asyncio.start_server` без сторонних веб-фреймворков. Вызовы `malloc_trim(0)` удерживают процесс в пределах 13–26 МБ RSS при лимите cgroups v2 `MemoryMax=128M`.
 
-1. **Hardware-Aware Load Shedding (Связка с amdgpu-sentinel):**
-   * Через POSIX Shared Memory (`/dev/shm/vram_guard`) шлюз за **< 100 наносекунд** без системных вызовов считывает состояние видеокарты AMD Radeon RX 6700 XT.
-   * Если утилизация VRAM превышает 85% или взведен флаг `ttm_alert`, шлюз применяет **Middle-Out Pruning**, сохраняя системный промпт и последние реплики, но вырезая середину диалога, предотвращая падение пропускной способности шины PCIe в 12.2 раза.
-2. **Защита от Threshold Decay (Recency Bias Anchors):**
-   * При сжатии истории критические системные директивы (`Zero-Allocation`, `POSIX`, `noexcept`) автоматически дублируются в конец последнего сообщения пользователя.
-3. **Active Slot Cancellation в llama-server:**
-   * При отмене запроса пользователем в IDE шлюз немедленно разрывает TCP-сокет к бэкенду, заставляя `llama-server` прервать генерацию и освободить вычислительные ресурсы GPU.
-4. **Адаптивный Circuit Breaker:**
-   * При трех подряд таймаутах медленной модели (32B) контур размыкается, и трафик перенаправляется на быстрый Qwen-7B с динамической инъекцией тегов `<think>`.
-5. **Сверхнизкий футпринт (RSS ~12.8 МБ):**
-   * Отказ от тяжелых фреймворков (FastAPI/Pydantic) в пользу чистого `asyncio.start_server`.
-   * Регулярная дефрагментация арен памяти glibc через `ctypes.CDLL('libc.so.6').malloc_trim(0)`.
-   * Изоляция в `systemd --user` с лимитом `MemoryMax=128M`.
+## Установка и запуск
 
----
+Требования: запущенный сервис [amdgpu-sentinel](https://github.com/BannedForWhat/amdgpu-sentinel) и инстансы llama-server на портах 8080, 8081, 8082.
 
-## Сборка и развертывание
-
-### Предварительные требования
-* Запущенный фоновый сервис телеметрии amdgpu-sentinel.
-* Кластер llama-server на портах 8080, 8081, 8082.
-
-### Установка сервиса
 ```bash
 git clone https://github.com/BannedForWhat/prompt-mesh.git
 cd prompt-mesh
 make install
 
-# Запуск службы в пользовательском сеансе
+# Запуск службы в сеансе пользователя
 systemctl --user enable --now prompt-mesh.service
-
-# Просмотр статуса и лимитов памяти cgroups v2
 systemctl --user status prompt-mesh.service
 ```
 
----
+## Метрики Prometheus
 
-## Наблюдаемость (Prometheus Metrics)
-
-Шлюз отдает платформенные метрики на эндпоинте `GET http://127.0.0.1:8000/metrics`:
+Эндпоинт `GET http://127.0.0.1:8000/metrics` отдает статистику работы:
 
 ```text
 # HELP prompt_mesh_requests_total Total requests processed
